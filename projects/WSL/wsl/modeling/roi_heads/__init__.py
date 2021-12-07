@@ -8,3 +8,4 @@ from .roi_heads_oicr import OICRROIHeads
 from .roi_heads_cmil import CMILROIHeads
 from .roi_heads_pcl import PCLROIHeads
 from .roi_heads_uwsod import UWSODROIHeads
+from .roi_heads_dsmil import DSMILROIHeads
