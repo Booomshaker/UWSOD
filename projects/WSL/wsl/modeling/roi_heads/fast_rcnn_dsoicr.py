@@ -9,12 +9,11 @@ from torch.nn import functional as F
 from detectron2.config import configurable
 from detectron2.layers import Linear, ShapeSpec, batched_nms, cat, nonzero_tuple
 from detectron2.modeling.box_regression import Box2BoxTransform
-from detectron2.structures import Boxes, Instances, pairwise_iou
+from detectron2.structures import Boxes, Instances
 from detectron2.utils.events import get_event_storage
 
-from wsl.layers import ROIMerge
-
-import pdb
+from wsl.layers import pcl_loss
+from wsl.modeling.roi_heads.third_party.pcl import PCL
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +148,7 @@ def fast_rcnn_inference_single_image(
     return result, filter_inds[:, 0], all_scores, all_boxes
 
 
-class WSDDNOutputs(object):
+class OICROutputs(object):
     """
     An internal implementation that stores information about outputs of a Fast R-CNN head,
     and provides methods that are used to decode the outputs of a Fast R-CNN head.
@@ -163,8 +162,9 @@ class WSDDNOutputs(object):
         proposals,
         smooth_l1_beta=0.0,
         box_reg_loss_type="smooth_l1",
-        mean_loss=False,
-        gt_classes_img_oh=None,
+        mean_loss=True,
+        refine_k=None,
+        has_reg=False,
     ):
         """
         Args:
@@ -216,7 +216,15 @@ class WSDDNOutputs(object):
         self._no_instances = len(proposals) == 0  # no instances found
 
         self.mean_loss = mean_loss
-        self.gt_classes_img_oh = gt_classes_img_oh
+
+        self.proposal_weights = torch.cat([p.gt_weights for p in proposals], dim=0)
+        self.proposal_weights[self.gt_classes == -1] = 0.0
+
+        self.valid_weights = torch.zeros_like(self.proposal_weights)
+        self.valid_weights[self.proposal_weights > 1e-12] = 1.0
+
+        self.refine_k = refine_k
+        self.has_reg = has_reg
 
     def _log_accuracy(self):
         """
@@ -237,10 +245,16 @@ class WSDDNOutputs(object):
 
         storage = get_event_storage()
         if num_instances > 0:
-            storage.put_scalar("fast_rcnn/cls_accuracy", num_accurate / num_instances)
+            storage.put_scalar(
+                "fast_rcnn/cls_accuracy" + self.refine_k, num_accurate / num_instances
+            )
             if num_fg > 0:
-                storage.put_scalar("fast_rcnn/fg_cls_accuracy", fg_num_accurate / num_fg)
-                storage.put_scalar("fast_rcnn/false_negative", num_false_negative / num_fg)
+                storage.put_scalar(
+                    "fast_rcnn/fg_cls_accuracy" + self.refine_k, fg_num_accurate / num_fg
+                )
+                storage.put_scalar(
+                    "fast_rcnn/false_negative" + self.refine_k, num_false_negative / num_fg
+                )
 
     def softmax_cross_entropy_loss(self):
         """
@@ -253,7 +267,12 @@ class WSDDNOutputs(object):
             return 0.0 * self.pred_class_logits.sum()
         else:
             self._log_accuracy()
-            return F.cross_entropy(self.pred_class_logits, self.gt_classes, reduction="mean")
+            loss = F.cross_entropy(
+                self.pred_class_logits, self.gt_classes, reduction="none", ignore_index=-1
+            )
+            loss = loss * self.proposal_weights
+
+            return loss.sum() / self.valid_weights.sum()
 
     def box_reg_loss(self):
         """
@@ -305,6 +324,20 @@ class WSDDNOutputs(object):
                 self.gt_boxes.tensor[fg_inds],
                 reduction="sum",
             )
+        elif self.box_reg_loss_type == "smooth_l1_weighted":
+            gt_proposal_deltas = self.box2box_transform.get_deltas(
+                self.proposals.tensor, self.gt_boxes.tensor
+            )
+            loss_box_reg = smooth_l1_loss(
+                self.pred_proposal_deltas[fg_inds[:, None], gt_class_cols],
+                gt_proposal_deltas[fg_inds],
+                self.smooth_l1_beta,
+                reduction="none",
+            )
+
+            loss_box_reg = loss_box_reg * self.proposal_weights[fg_inds, None]
+            loss_box_reg = loss_box_reg.sum()
+            # loss_box_reg = loss_box_reg.sum() / self.valid_weights[fg_inds].sum()
         else:
             raise ValueError(f"Invalid bbox reg loss type '{self.box_reg_loss_type}'")
 
@@ -322,37 +355,6 @@ class WSDDNOutputs(object):
         loss_box_reg = loss_box_reg / self.gt_classes.numel()
         return loss_box_reg
 
-    def binary_cross_entropy_loss(self):
-        """
-        Compute the softmax cross entropy loss for box classification.
-
-        Returns:
-            scalar Tensor
-        """
-        # self._log_accuracy()
-
-        reduction = "mean" if self.mean_loss else "sum"
-        return F.binary_cross_entropy(
-            self.predict_probs_img(), self.gt_classes_img_oh, reduction=reduction
-        ) / self.gt_classes_img_oh.size(0)
-
-    def predict_probs_img(self):
-        if not hasattr(self, "pred_class_img_logits"):
-            if len(self.num_preds_per_image) == 1:
-                self.pred_class_img_logits = torch.sum(self.pred_class_logits, dim=0, keepdim=True)
-            else:
-                self.pred_class_img_logits = cat(
-                    [
-                        torch.sum(xx, dim=0, keepdim=True)
-                        for xx in self.pred_class_logits.split(self.num_preds_per_image, dim=0)
-                    ],
-                    dim=0,
-                )
-            self.pred_class_img_logits = torch.clamp(
-                self.pred_class_img_logits, min=1e-6, max=1.0 - 1e-6
-            )
-        return self.pred_class_img_logits
-
     def _predict_boxes(self):
         """
         Returns:
@@ -364,7 +366,7 @@ class WSDDNOutputs(object):
 
     """
     A subclass is expected to have the following methods because
-    they are used to query information about the head predictions.
+    they are used to query information about the head predictions.0
     """
 
     def losses(self):
@@ -375,8 +377,12 @@ class WSDDNOutputs(object):
         Returns:
             A dict of losses (scalar tensors) containing keys "loss_cls" and "loss_box_reg".
         """
-        # return {"loss_cls": self.softmax_cross_entropy_loss(), "loss_box_reg": self.box_reg_loss()}
-        return {"loss_cls": self.binary_cross_entropy_loss()}
+        if not self.has_reg:
+            return {"loss_cls" + self.refine_k: self.softmax_cross_entropy_loss()}
+        return {
+            "loss_cls" + self.refine_k: self.softmax_cross_entropy_loss(),
+            "loss_box_reg" + self.refine_k: self.box_reg_loss(),
+        }
 
     def predict_boxes(self):
         """
@@ -388,12 +394,7 @@ class WSDDNOutputs(object):
         """
         Deprecated
         """
-        # probs = F.softmax(self.pred_class_logits, dim=-1)
-        probs = self.pred_class_logits
-        probs_bg = torch.zeros(
-            probs.shape[0], 1, dtype=probs.dtype, device=probs.device, requires_grad=False
-        )
-        probs = torch.cat((probs, probs_bg), 1)
+        probs = F.softmax(self.pred_class_logits, dim=-1)
         return probs.split(self.num_preds_per_image, dim=0)
 
     def inference(self, score_thresh, nms_thresh, topk_per_image):
@@ -408,7 +409,7 @@ class WSDDNOutputs(object):
         )
 
 
-class DSMILOutputLayers(nn.Module):
+class DSOICROutputLayers(nn.Module):
     """
     Two linear layers for predicting Fast R-CNN outputs:
       (1) proposal-to-detection box regression deltas
@@ -418,10 +419,10 @@ class DSMILOutputLayers(nn.Module):
     @configurable
     def __init__(
         self,
-        input_shape: ShapeSpec,
+        input_shape,
         *,
         box2box_transform,
-        num_classes: int,
+        num_classes,
         test_score_thresh: float = 0.0,
         test_nms_thresh: float = 0.5,
         test_topk_per_image: int = 100,
@@ -430,10 +431,8 @@ class DSMILOutputLayers(nn.Module):
         box_reg_loss_type: str = "smooth_l1",
         loss_weight: Union[float, Dict[str, float]] = 1.0,
         mean_loss: bool = True,
-        cmil: bool = False,
-        display: int = 1280,
-        max_epoch: int = 40,
-        size_epoch: int = 5000,
+        refine_k: int = None,
+        refine_reg: bool = False,
     ):
         """
         NOTE: this interface is experimental.
@@ -455,26 +454,21 @@ class DSMILOutputLayers(nn.Module):
                     "loss_box_reg" - applied to box regression loss
         """
         super().__init__()
-        if isinstance(input_shape, int):  # some backward compatibility
+        if isinstance(input_shape, int):  # some backward compatbility
             input_shape = ShapeSpec(channels=input_shape)
         input_size = input_shape.channels * (input_shape.width or 1) * (input_shape.height or 1)
-
+        # prediction layer for num_classes foreground classes and one background class (hence + 1)
+        self.cls_score = Linear(input_size, num_classes + 1)
         num_bbox_reg_classes = 1 if cls_agnostic_bbox_reg else num_classes
         box_dim = len(box2box_transform.weights)
+        self.bbox_pred = Linear(input_size, num_bbox_reg_classes * box_dim)
 
         self.num_bbox_reg_classes = num_bbox_reg_classes
         self.box_dim = box_dim
 
-        self.cls = Linear(input_size, num_classes)
-        self.det = Linear(input_size, num_classes)
-        self.q = Linear(input_size, 256)
-
-        # nn.init.normal_(self.cls.weight, std=0.01)
-        # nn.init.normal_(self.det.weight, std=0.01)
-        nn.init.xavier_uniform_(self.cls.weight)
-        nn.init.xavier_uniform_(self.det.weight)
-        nn.init.xavier_uniform_(self.q.weight)
-        for l in [self.cls, self.det, self.q]:
+        nn.init.normal_(self.cls_score.weight, std=0.01)
+        nn.init.normal_(self.bbox_pred.weight, std=0.001)
+        for l in [self.cls_score, self.bbox_pred]:
             nn.init.constant_(l.bias, 0)
 
         self.box2box_transform = box2box_transform
@@ -488,16 +482,12 @@ class DSMILOutputLayers(nn.Module):
         self.loss_weight = loss_weight
 
         self.mean_loss = mean_loss
-
-        self.cmil = cmil
-        if cmil:
-            self.display = display
-            self.max_epoch = max_epoch
-            self.size_epoch = size_epoch
-            self.roi_merge = ROIMerge(0, display, max_epoch, size_epoch)
+        self.refine_k = refine_k
+        self.refine_reg = refine_reg
+        self.q = Linear(input_size, 256)
 
     @classmethod
-    def from_config(cls, cfg, input_shape):
+    def from_config(cls, cfg, input_shape, refine_k):
         return {
             "input_shape": input_shape,
             "box2box_transform": Box2BoxTransform(weights=cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS),
@@ -511,14 +501,12 @@ class DSMILOutputLayers(nn.Module):
             "box_reg_loss_type"     : cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_LOSS_TYPE,
             "loss_weight"           : {"loss_box_reg": cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_LOSS_WEIGHT},
             "mean_loss"             : cfg.WSL.MEAN_LOSS,
-            "cmil"                  : cfg.WSL.CMIL,
-            "display"               : int(1280 / cfg.SOLVER.IMS_PER_BATCH),
-            "max_epoch"             : int(cfg.SOLVER.MAX_ITER / cfg.WSL.SIZE_EPOCH),
-            "size_epoch"            : cfg.WSL.SIZE_EPOCH,
+            "refine_reg"            : cfg.WSL.REFINE_REG,
+            "refine_k"              : refine_k,
             # fmt: on
         }
 
-    def forward(self, x, proposals=None, context=False):
+    def forward(self, x):
         """
         Args:
             x: per-region features of shape (N, ...) for N bounding boxes to predict.
@@ -529,32 +517,9 @@ class DSMILOutputLayers(nn.Module):
             Tensor: bounding box regression deltas for each box. Shape is shape (N,Kx4), or (N,4)
                 for class-agnostic regression.
         """
-        if context:
-            C, D = self.forward_contextlocnet(x, proposals=proposals)
-        else:
-            if x.dim() > 2:
-                x = torch.flatten(x, start_dim=1)
-            C = self.cls(x)
-            D = self.det(x)
-
-        if self.cmil and self.training:
-            C, D, Oscores, Oproposal_deltas = self.forward_cmil(C, D, proposals)
-
-        if proposals is None:
-            scores = F.softmax(C, dim=1) * F.softmax(D, dim=0)
-        elif len(proposals) == 1:
-            scores = F.softmax(C, dim=1) * F.softmax(D, dim=0)
-        else:
-            num_preds_per_image = [len(p) for p in proposals]
-            scores = cat(
-                [
-                    F.softmax(c, dim=1) * F.softmax(d, dim=0)
-                    for c, d in zip(
-                        C.split(num_preds_per_image, dim=0), D.split(num_preds_per_image, dim=0)
-                    )
-                ],
-                dim=0,
-            )
+        if x.dim() > 2:
+            x = torch.flatten(x, start_dim=1)
+        scores = self.cls_score(x)
 
         # ds attention
         Q = self.q(x)    # N * Q
@@ -565,87 +530,20 @@ class DSMILOutputLayers(nn.Module):
         attentions = F.sigmoid(attentions)   # N * C
         scores = scores * attentions
 
-        proposal_deltas = torch.zeros(
-            scores.shape[0],
-            self.num_bbox_reg_classes * self.box_dim,
-            dtype=scores.dtype,
-            device=scores.device,
-            requires_grad=False,
-        )
-
-        if self.cmil and self.training:
-            return scores, proposal_deltas, Oscores, Oproposal_deltas
+        if self.refine_reg[self.refine_k]:
+            proposal_deltas = self.bbox_pred(x)
+        else:
+            proposal_deltas = torch.zeros(
+                scores.shape[0],
+                self.num_bbox_reg_classes * self.box_dim,
+                dtype=scores.dtype,
+                device=scores.device,
+                requires_grad=False,
+            )
         return scores, proposal_deltas
 
-    def forward_contextlocnet(self, x, proposals=None):
-        """
-        Args:
-            x: per-region features of shape (N, ...) for N bounding boxes to predict.
-
-        Returns:
-            Tensor: shape (N,K+1), scores for each of the N box. Each row contains the scores for
-                K object categories and 1 background class.
-            Tensor: bounding box regression deltas for each box. Shape is shape (N,Kx4), or (N,4)
-                for class-agnostic regression.
-        """
-        x, Fx, Cx = x[:]
-        if x.dim() > 2:
-            x = torch.flatten(x, start_dim=1)
-        if Fx.dim() > 2:
-            Fx = torch.flatten(Fx, start_dim=1)
-        if Cx.dim() > 2:
-            Cx = torch.flatten(Cx, start_dim=1)
-
-        return self.cls(x), self.det(Fx) - self.det(Cx)
-
-    def forward_cmil(self, C, D, proposals):
-        """
-        Args:
-            x: per-region features of shape (N, ...) for N bounding boxes to predict.
-
-        Returns:
-            Tensor: shape (N,K+1), scores for each of the N box. Each row contains the scores for
-                K object categories and 1 background class.
-            Tensor: bounding box regression deltas for each box. Shape is shape (N,Kx4), or (N,4)
-                for class-agnostic regression.
-        """
-
-        if proposals is None:
-            scores = F.softmax(C, dim=1) * F.softmax(D, dim=0)
-        elif len(proposals) == 1:
-            scores = F.softmax(C, dim=1) * F.softmax(D, dim=0)
-        else:
-            num_preds_per_image = [len(p) for p in proposals]
-            scores = cat(
-                [
-                    F.softmax(c, dim=1) * F.softmax(d, dim=0)
-                    for c, d in zip(
-                        C.split(num_preds_per_image, dim=0), D.split(num_preds_per_image, dim=0)
-                    )
-                ],
-                dim=0,
-            )
-
-        proposal_deltas = torch.zeros(
-            scores.shape[0],
-            self.num_bbox_reg_classes * self.box_dim,
-            dtype=scores.dtype,
-            device=scores.device,
-            requires_grad=False,
-        )
-
-        # num_preds_per_image = [len(p) for p in proposals]
-        rois_obn_score = torch.sum(scores, dim=1, keepdim=True)
-        # rois_obn_score = torch.clamp(rois_obn_score, min=1e-6, max=1.0 - 1e-6)
-
-        assert proposals
-        J = cat([pairwise_iou(p.proposal_boxes, p.proposal_boxes) for p in proposals], dim=0)
-
-        MC, MD = self.roi_merge(rois_obn_score.cpu(), J.cpu(), C.cpu(), D.cpu())
-        return MC.to(C.device), MD.to(D.device), scores, proposal_deltas
-
     # TODO: move the implementation to this class.
-    def losses(self, predictions, proposals, gt_classes_img_oh):
+    def losses(self, predictions, proposals):
         """
         Args:
             predictions: return values of :meth:`forward()`.
@@ -657,7 +555,7 @@ class DSMILOutputLayers(nn.Module):
             Dict[str, Tensor]: dict of losses
         """
         scores, proposal_deltas = predictions
-        losses = WSDDNOutputs(
+        losses = OICROutputs(
             self.box2box_transform,
             scores,
             proposal_deltas,
@@ -665,44 +563,40 @@ class DSMILOutputLayers(nn.Module):
             self.smooth_l1_beta,
             self.box_reg_loss_type,
             self.mean_loss,
+            "_r" + str(self.refine_k),
+            has_reg=self.refine_reg[self.refine_k],
+        ).losses()
+        return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
+
+    # TODO: move the implementation to this class.
+    def losses_pcl(self, predictions, proposals, last_scores, gt_classes_img_oh):
+        """
+        Args:
+            predictions: return values of :meth:`forward()`.
+            proposals (list[Instances]): proposals that match the features that were used
+                to compute predictions. The fields ``proposal_boxes``, ``gt_boxes``,
+                ``gt_classes`` are expected.
+
+        Returns:
+            Dict[str, Tensor]: dict of losses
+        """
+        scores, proposal_deltas = predictions
+        losses = PCLOutputs(
+            self.box2box_transform,
+            scores,
+            proposal_deltas,
+            proposals,
+            self.smooth_l1_beta,
+            self.box_reg_loss_type,
+            self.mean_loss,
+            last_scores,
             gt_classes_img_oh,
+            "_r" + str(self.refine_k),
+            has_reg=self.refine_reg[self.refine_k],
         ).losses()
         return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
 
-    # TODO: move the implementation to this class.
-    def losses_csc(
-        self, predictions, proposals, W_pos, W_neg, PL, NL, csc_stats, loss_weight=1.0, prefix=""
-    ):
-        """
-        Args:
-            predictions: return values of :meth:`forward()`.
-            proposals (list[Instances]): proposals that match the features that were used
-                to compute predictions. The fields ``proposal_boxes``, ``gt_boxes``,
-                ``gt_classes`` are expected.
-
-        Returns:
-            Dict[str, Tensor]: dict of losses
-        """
-        scores, proposal_deltas = predictions
-        losses = CSCOutputs(
-            self.box2box_transform,
-            scores,
-            proposal_deltas,
-            proposals,
-            self.smooth_l1_beta,
-            self.box_reg_loss_type,
-            self.mean_loss,
-            W_pos,
-            W_neg,
-            PL,
-            NL,
-            csc_stats,
-            loss_weight=loss_weight,
-            prefix=prefix,
-        ).losses()
-        return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
-
-    def inference(self, predictions, proposals):
+    def inference(self, predictions, proposals, pcl_bg=False):
         """
         Args:
             predictions: return values of :meth:`forward()`.
@@ -713,9 +607,18 @@ class DSMILOutputLayers(nn.Module):
             list[Instances]: same as `fast_rcnn_inference`.
             list[Tensor]: same as `fast_rcnn_inference`.
         """
-        boxes = self.predict_boxes(predictions, proposals)
-        scores = self.predict_probs(predictions, proposals)
+        if isinstance(predictions[0], tuple):
+            boxes = self.predict_boxes_K(predictions, proposals)
+            scores = self.predict_probs_K(predictions, proposals)
+        else:
+            boxes = self.predict_boxes(predictions, proposals)
+            scores = self.predict_probs(predictions, proposals)
         image_shapes = [x.image_size for x in proposals]
+
+        if pcl_bg:
+            scores = [cat((score[:, 1:], score[:, :1]), 1) for score in scores]
+            # boxes = [cat((box[:, 4:], box[:, :4]), 1) for box in boxes]
+
         return fast_rcnn_inference(
             boxes,
             scores,
@@ -783,6 +686,33 @@ class DSMILOutputLayers(nn.Module):
         )  # Nx(KxB)
         return predict_boxes.split(num_prop_per_image)
 
+    def predict_boxes_K(self, predictions, proposals):
+        """
+        Args:
+            predictions: return values of :meth:`forward()`.
+            proposals (list[Instances]): proposals that match the features that were
+                used to compute predictions. The ``proposal_boxes`` field is expected.
+
+        Returns:
+            list[Tensor]: A list of Tensors of predicted class-specific or class-agnostic boxes
+                for each image. Element i has shape (Ri, K * B) or (Ri, B), where Ri is
+                the number of proposals for image i and B is the box dimension (4 or 5)
+        """
+        if not len(proposals):
+            return []
+        proposal_deltas_K = [p[1] for p in predictions]
+        proposal_deltas = torch.zeros_like(proposal_deltas_K[0])
+        for proposal_deltas_k in proposal_deltas_K:
+            proposal_deltas += proposal_deltas_k
+        proposal_deltas = proposal_deltas / len(proposal_deltas_K)
+        num_prop_per_image = [len(p) for p in proposals]
+        proposal_boxes = [p.proposal_boxes for p in proposals]
+        proposal_boxes = proposal_boxes[0].cat(proposal_boxes).tensor
+        predict_boxes = self.box2box_transform.apply_deltas(
+            proposal_deltas, proposal_boxes
+        )  # Nx(KxB)
+        return predict_boxes.split(num_prop_per_image)
+
     def predict_probs(self, predictions, proposals):
         """
         Args:
@@ -796,32 +726,30 @@ class DSMILOutputLayers(nn.Module):
         """
         scores, _ = predictions
         num_inst_per_image = [len(p) for p in proposals]
-        # probs = F.softmax(scores, dim=-1)
-        probs = scores
-        probs_bg = torch.zeros(
-            probs.shape[0], 1, dtype=probs.dtype, device=probs.device, requires_grad=False
-        )
-        probs = torch.cat((probs, probs_bg), 1)
+        probs = F.softmax(scores, dim=-1)
         return probs.split(num_inst_per_image, dim=0)
 
-    def predict_probs_img(self, predictions, proposals):
-        scores, _ = predictions
-        if len(proposals) == 1:
-            pred_class_img_logits = torch.sum(scores, dim=0, keepdim=True)
-        else:
-            num_inst_per_image = [len(p) for p in proposals]
-            pred_class_img_logits = cat(
-                [
-                    torch.sum(score, dim=0, keepdim=True)
-                    for score in scores.split(num_inst_per_image, dim=0)
-                ],
-                dim=0,
-            )
-        pred_class_img_logits = torch.clamp(pred_class_img_logits, min=1e-6, max=1.0 - 1e-6)
-        return pred_class_img_logits
+    def predict_probs_K(self, predictions, proposals):
+        """
+        Args:
+            predictions: return values of :meth:`forward()`.
+            proposals (list[Instances]): proposals that match the features that were
+                used to compute predictions.
+
+        Returns:
+            list[Tensor]: A list of Tensors of predicted class probabilities for each image.
+                Element i has shape (Ri, K + 1), where Ri is the number of proposals for image i.
+        """
+        scores_K = [p[0] for p in predictions]
+        num_inst_per_image = [len(p) for p in proposals]
+        probs = torch.zeros_like(scores_K[0])
+        for scores_k in scores_K:
+            probs += F.softmax(scores_k, dim=-1)
+        probs = probs / len(scores_K)
+        return probs.split(num_inst_per_image, dim=0)
 
 
-class CSCOutputs(object):
+class PCLOutputs(object):
     """
     An internal implementation that stores information about outputs of a Fast R-CNN head,
     and provides methods that are used to decode the outputs of a Fast R-CNN head.
@@ -835,14 +763,11 @@ class CSCOutputs(object):
         proposals,
         smooth_l1_beta=0.0,
         box_reg_loss_type="smooth_l1",
-        mean_loss=False,
-        W_pos=None,
-        W_neg=None,
-        PL=None,
-        NL=None,
-        csc_stats=None,
-        loss_weight=1.0,
-        prefix="",
+        mean_loss=True,
+        last_score=None,
+        gt_classes_img_oh=None,
+        refine_k=None,
+        has_reg=False,
     ):
         """
         Args:
@@ -894,13 +819,10 @@ class CSCOutputs(object):
         self._no_instances = len(proposals) == 0  # no instances found
 
         self.mean_loss = mean_loss
-        self.W_pos = W_pos
-        self.W_neg = W_neg
-        self.PL = PL
-        self.NL = NL
-        self.csc_stats = csc_stats
-        self.loss_weight = loss_weight
-        self.prefix = prefix
+        self.last_score = last_score
+        self.gt_classes_img_oh = gt_classes_img_oh
+        self.refine_k = refine_k
+        self.has_reg = has_reg
 
     def _log_accuracy(self):
         """
@@ -921,10 +843,16 @@ class CSCOutputs(object):
 
         storage = get_event_storage()
         if num_instances > 0:
-            storage.put_scalar("fast_rcnn/cls_accuracy", num_accurate / num_instances)
+            storage.put_scalar(
+                "fast_rcnn/cls_accuracy" + self.refine_k, num_accurate / num_instances
+            )
             if num_fg > 0:
-                storage.put_scalar("fast_rcnn/fg_cls_accuracy", fg_num_accurate / num_fg)
-                storage.put_scalar("fast_rcnn/false_negative", num_false_negative / num_fg)
+                storage.put_scalar(
+                    "fast_rcnn/fg_cls_accuracy" + self.refine_k, fg_num_accurate / num_fg
+                )
+                storage.put_scalar(
+                    "fast_rcnn/false_negative" + self.refine_k, num_false_negative / num_fg
+                )
 
     def softmax_cross_entropy_loss(self):
         """
@@ -934,10 +862,41 @@ class CSCOutputs(object):
             scalar Tensor
         """
         if self._no_instances:
-            return 0.0 * self.pred_class_logits.sum()
+            # TODO 0.0 * pred.sum() is enough since PT1.6
+            return 0.0 * F.cross_entropy(
+                self.pred_class_logits,
+                torch.zeros(0, dtype=torch.long, device=self.pred_class_logits.device),
+                reduction="sum",
+            )
         else:
             self._log_accuracy()
-            return F.cross_entropy(self.pred_class_logits, self.gt_classes, reduction="mean")
+            loss = F.cross_entropy(
+                self.pred_class_logits, self.gt_classes, reduction="none", ignore_index=-1
+            )
+            loss = loss * self.proposal_weights
+
+            return loss.sum() / self.valid_weights.sum()
+
+    def pcl_loss(self):
+        boxes = self.proposals.tensor.data.cpu().numpy()
+        refine = self.predict_probs()
+
+        im_labels = self.gt_classes_img_oh.data.cpu().numpy()
+
+        pcl_output = PCL(boxes, self.last_score, im_labels, refine[0].clone().detach())
+
+        refine_loss = pcl_loss(
+            refine[0],
+            torch.from_numpy(pcl_output["labels"]),
+            torch.from_numpy(pcl_output["cls_loss_weights"]),
+            torch.from_numpy(pcl_output["gt_assignment"]),
+            torch.from_numpy(pcl_output["pc_labels"]),
+            torch.from_numpy(pcl_output["pc_probs"]),
+            torch.from_numpy(pcl_output["pc_count"]),
+            torch.from_numpy(pcl_output["img_cls_loss_weights"]),
+            torch.from_numpy(pcl_output["im_labels_real"]),
+        )
+        return refine_loss
 
     def box_reg_loss(self):
         """
@@ -1006,82 +965,6 @@ class CSCOutputs(object):
         loss_box_reg = loss_box_reg / self.gt_classes.numel()
         return loss_box_reg
 
-    def csc_loss(self):
-        """
-        Compute the softmax cross entropy loss for box classification.
-
-        Returns:
-            scalar Tensor
-        """
-        self._log_accuracy()
-
-        pred_class_logits_pos = self.pred_class_logits * self.W_pos
-        pred_class_logits_neg = self.pred_class_logits * self.W_neg
-
-        pred_class_img_logits_pos = torch.sum(pred_class_logits_pos, dim=0, keepdim=True)
-        pred_class_img_logits_pos = torch.clamp(
-            pred_class_img_logits_pos, min=1e-20, max=1.0 - 1e-20
-        )
-
-        pred_class_img_logits_neg = torch.sum(pred_class_logits_neg, dim=0, keepdim=True)
-        pred_class_img_logits_neg = torch.clamp(
-            pred_class_img_logits_neg, min=1e-20, max=1.0 - 1e-20
-        )
-
-        self.csc_stats.UpdateIterStats(
-            self.PL.data.cpu().numpy(),
-            self.predict_probs_img().data.cpu().numpy(),
-            pred_class_img_logits_pos.data.cpu().numpy(),
-            pred_class_img_logits_neg.data.cpu().numpy(),
-            self.W_pos.data.cpu().numpy(),
-            self.W_neg.data.cpu().numpy(),
-        )
-        self.csc_stats.LogIterStats()
-
-        reduction = "mean" if self.mean_loss else "sum"
-        return {
-            self.prefix
-            + "loss_cls_pos": F.binary_cross_entropy(
-                pred_class_img_logits_pos, self.PL, reduction=reduction
-            )
-            * self.loss_weight
-            / self.PL.size(0),
-            self.prefix
-            + "loss_cls_neg": F.binary_cross_entropy(
-                pred_class_img_logits_neg, self.NL, reduction=reduction
-            )
-            * self.loss_weight
-            / self.NL.size(0),
-        }
-
-    def binary_cross_entropy_loss(self):
-        """
-        Compute the softmax cross entropy loss for box classification.
-
-        Returns:
-            scalar Tensor
-        """
-        self._log_accuracy()
-
-        reduction = "mean" if self.mean_loss else "sum"
-        return F.binary_cross_entropy(
-            self.predict_probs_img(), self.gt_classes_img_oh, reduction=reduction
-        ) / self.gt_classes_img_oh.size(0)
-
-    def predict_probs_img(self):
-        if not hasattr(self, "pred_class_img_logits"):
-            self.pred_class_img_logits = cat(
-                [
-                    torch.sum(xx, dim=0, keepdim=True)
-                    for xx in self.pred_class_logits.split(self.num_preds_per_image, dim=0)
-                ],
-                dim=0,
-            )
-            self.pred_class_img_logits = torch.clamp(
-                self.pred_class_img_logits, min=1e-6, max=1.0 - 1e-6
-            )
-        return self.pred_class_img_logits
-
     def _predict_boxes(self):
         """
         Returns:
@@ -1104,8 +987,12 @@ class CSCOutputs(object):
         Returns:
             A dict of losses (scalar tensors) containing keys "loss_cls" and "loss_box_reg".
         """
-        # return {"loss_cls": self.softmax_cross_entropy_loss(), "loss_box_reg": self.box_reg_loss()}
-        return {**self.csc_loss()}
+        if not self.has_reg:
+            return {"loss_cls" + self.refine_k: self.pcl_loss()}
+        return {
+            "loss_cls" + self.refine_k: self.pcl_loss(),
+            "loss_box_reg" + self.refine_k: self.box_reg_loss(),
+        }
 
     def predict_boxes(self):
         """
@@ -1117,12 +1004,7 @@ class CSCOutputs(object):
         """
         Deprecated
         """
-        # probs = F.softmax(self.pred_class_logits, dim=-1)
-        probs = self.pred_class_logits
-        probs_bg = torch.zeros(
-            probs.shape[0], 1, dtype=probs.dtype, device=probs.device, requires_grad=False
-        )
-        probs = torch.cat((probs, probs_bg), 1)
+        probs = F.softmax(self.pred_class_logits, dim=-1)
         return probs.split(self.num_preds_per_image, dim=0)
 
     def inference(self, score_thresh, nms_thresh, topk_per_image):
@@ -1132,6 +1014,10 @@ class CSCOutputs(object):
         boxes = self.predict_boxes()
         scores = self.predict_probs()
         image_shapes = self.image_shapes
+
+        scores = [cat((score[:, 1:], score[:, :1]), 1) for score in scores]
+        # boxes = [cat((box[:, 4:], box[:, :4]), 1) for box in boxes]
+
         return fast_rcnn_inference(
             boxes, scores, image_shapes, score_thresh, nms_thresh, topk_per_image
         )

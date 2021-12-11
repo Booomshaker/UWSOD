@@ -18,7 +18,7 @@ MODEL:
     NAME: "PrecomputedProposals"
     MIN_SIZE: 20
   ROI_HEADS:
-    NAME: "OICRROIHeads"
+    NAME: "DSOICRROIHeads"
     NUM_CLASSES: 20
     SCORE_THRESH_TEST: 0.00001
     NMS_THRESH_TEST: 0.3
