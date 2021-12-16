@@ -237,8 +237,9 @@ def build_vgg_backbone(cfg, input_shape):
     # fmt: off
     depth                = cfg.MODEL.VGG.DEPTH
     conv5_dilation       = cfg.MODEL.VGG.CONV5_DILATION
+    out_features         = cfg.MODEL.VGG.OUT_FEATURES
     freeze_at            = cfg.MODEL.BACKBONE.FREEZE_AT
     # fmt: on
 
     if depth == 16:
-        return VGG16(conv5_dilation, freeze_at)
+        return VGG16(conv5_dilation, freeze_at, out_features=out_features)

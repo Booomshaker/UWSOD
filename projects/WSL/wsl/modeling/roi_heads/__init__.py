@@ -11,3 +11,4 @@ from .roi_heads_uwsod import UWSODROIHeads
 from .roi_heads_dsmil import DSMILROIHeads
 from .roi_heads_dsoicr import DSOICRROIHeads
 from .roi_heads_loco_wsddn import LOCOROIHeads
+from .roi_heads_pgta_oicr import PGTAOICRROIHeads

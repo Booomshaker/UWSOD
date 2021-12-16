@@ -65,3 +65,7 @@ def add_wsl_config(cfg):
     _C.MODEL.MRRP.BRANCH_DILATIONS = [1, 2, 3]
     _C.MODEL.MRRP.MRRP_STAGE = "res4"
     _C.MODEL.MRRP.TEST_BRANCH_IDX = 1
+
+    _C.MODEL.PGTA = CN()
+    _C.MODEL.PGTA.VISUALIZE = False
+    _C.MODEL.PGTA.LOSS_WEIGHT = 1.

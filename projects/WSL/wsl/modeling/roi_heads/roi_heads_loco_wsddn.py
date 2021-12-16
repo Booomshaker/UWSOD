@@ -84,9 +84,9 @@ class LOCOROIHeads(ROIHeads):
         # loco
         self.contrastive_embed_dim = 256
         self.loco_encoder = Linear(4096, self.contrastive_embed_dim)
-        self.tau = 1.
+        self.tau = 10.
         # self.tau = 0.07
-        self.contrastive_weight = 0.1
+        self.contrastive_weight = 0.5
 
         self.mask_on = mask_in_features is not None
         if self.mask_on:
@@ -366,12 +366,14 @@ class LOCOROIHeads(ROIHeads):
             contrastive_embeds_all = contrastive_embeds_flatten * self.gt_classes_img_oh.view(-1, 1)
             all_dist = torch.matmul(contrastive_embeds_all, contrastive_embeds_all.transpose(-1, -2)).sum() / 2
             loss_info_nce = -torch.log(torch.exp(pos_dist / self.tau) / torch.exp(all_dist / self.tau))
-            if torch.isnan(loss_info_nce).item():
-                print("pos_dist", pos_dist)
-                print("all_dist", all_dist)
-
             cur_contrastive_weight = gt_class_score_sum / len(torch.cat(self.gt_classes_img_int))
-            losses.update({'loss_info_nce': loss_info_nce * self.contrastive_weight * cur_contrastive_weight})
+            loss_info_nce = loss_info_nce * self.contrastive_weight * cur_contrastive_weight
+            if torch.isnan(loss_info_nce).item() or torch.isinf(loss_info_nce).item():
+                # print("pos_dist", pos_dist)
+                # print("all_dist", all_dist)
+                loss_info_nce = torch.tensor(0., device=loss_info_nce.device)
+            
+            losses.update({'loss_info_nce': loss_info_nce})
             return losses
         else:
             pred_instances, _, all_scores, all_boxes = self.box_predictor.inference(

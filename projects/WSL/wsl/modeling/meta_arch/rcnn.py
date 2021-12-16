@@ -5,6 +5,7 @@ import numpy as np
 from typing import Optional, Tuple
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from detectron2.config import configurable
 from detectron2.data.detection_utils import convert_image_to_rgb
@@ -17,6 +18,8 @@ from detectron2.utils.events import get_event_storage
 from detectron2.utils.logger import log_first_n
 
 from ..postprocessing import detector_postprocess
+
+import pdb
 
 __all__ = ["GeneralizedRCNNWSL", "ProposalNetworkWSL"]
 
@@ -77,6 +80,10 @@ class GeneralizedRCNNWSL(nn.Module):
     @classmethod
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
+        cls.visualize_pgta = cfg.MODEL.PGTA.VISUALIZE
+        if cls.visualize_pgta:
+            cls.image_cnt = 0
+        cls.output_dir = cfg.MODEL.WEIGHTS.split(".")[0] + "_pgta"
         return {
             "backbone": backbone,
             "proposal_generator": build_proposal_generator(cfg, backbone.output_shape()),
@@ -166,7 +173,6 @@ class GeneralizedRCNNWSL(nn.Module):
             images.tensor.requires_grad = True
 
         features = self.backbone(images.tensor)
-
         if self.proposal_generator:
             proposals, _ = self.proposal_generator(images, features, gt_instances)
             for i, p in enumerate(proposals):
@@ -239,8 +245,12 @@ class GeneralizedRCNNWSL(nn.Module):
             else:
                 assert "proposals" in batched_inputs[0]
                 proposals = [x["proposals"].to(self.device) for x in batched_inputs]
+            if self.visualize_pgta:
+                results, _, all_scores, all_boxes, pgta_data = self.roi_heads(images, features, proposals, None)
+                self.draw_pgta(images, pgta_data)
 
-            results, _, all_scores, all_boxes = self.roi_heads(images, features, proposals, None)
+            else:
+                results, _, all_scores, all_boxes = self.roi_heads(images, features, proposals, None)
         else:
             detected_instances = [x.to(self.device) for x in detected_instances]
             results, all_scores, all_boxes = self.roi_heads.forward_with_given_boxes(
@@ -251,6 +261,48 @@ class GeneralizedRCNNWSL(nn.Module):
             return GeneralizedRCNNWSL._postprocess(results, batched_inputs, images.image_sizes)
         else:
             return results, all_scores, all_boxes
+
+    def draw_pgta(self, images, pgta_data):
+        import os
+        import cv2
+        def _draw_heatmap(image, heatmap):
+            # heatmap = heatmap - np.min(heatmap)
+            # heatmap = heatmap / np.max(heatmap)
+            heatmap = heatmap - self.hm_min_val
+            heatmap = heatmap / self.hm_max_val
+            heatmap = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)   # 将热力图分散到rgb通道
+            print(heatmap.max())
+            img_with_hm = np.float32(heatmap) / 255 + np.float32(image) / 255
+            img_with_hm = img_with_hm / np.max(img_with_hm)
+            img_with_hm = np.uint8(255 * img_with_hm)
+            return img_with_hm
+
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+
+        im = images.tensor[0, ...].clone().detach().cpu().numpy()
+        im_w, im_h = images.image_sizes[0][1], images.image_sizes[0][0]
+        im = im.transpose((1, 2, 0))
+        pixel_means = [102.9801, 115.9465, 122.7717]
+        im += pixel_means
+        im = np.ascontiguousarray(im)
+        im = im.astype(np.uint8)
+        
+        source_map = pgta_data['source_map'].detach()
+        pgt_map = pgta_data['pgt_map'].detach()
+        self.hm_max_val = max(torch.max(source_map).item(), torch.max(pgt_map).item())
+        self.hm_min_val = min(torch.min(source_map).item(), torch.min(pgt_map).item())
+
+        source_map = F.interpolate(source_map, (im_h, im_w)).squeeze().cpu().numpy()
+        source_hm = _draw_heatmap(im, source_map)
+        cv2.imwrite(os.path.join(self.output_dir, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
+        
+        pgt_map = F.interpolate(pgt_map, (im_h, im_w)).squeeze().cpu().numpy()
+        pgt_hm = _draw_heatmap(im, pgt_map)
+        cv2.imwrite(os.path.join(self.output_dir, 'pgt_{}.jpg'.format(self.image_cnt)), pgt_hm)
+        self.image_cnt += 1
+        pdb.set_trace()
+
 
     def preprocess_image(self, batched_inputs):
         """
