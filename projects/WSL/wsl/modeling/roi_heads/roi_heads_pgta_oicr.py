@@ -397,7 +397,7 @@ class PGTAOICRROIHeads(ROIHeads):
             grad_cam = grad_cam.unsqueeze(0)
         
 
-        GEN_FORWARD_PGT = False
+        GEN_FORWARD_PGT = True
         if GEN_FORWARD_PGT:
             # generate forward pgt
             features_interpolate = [F.interpolate(x, last_feats.shape[2:]) for x in features]   # interpolate: list([N, d, H, W])
@@ -482,8 +482,8 @@ class PGTAOICRROIHeads(ROIHeads):
 
             # pgta loss
             
-            # pgta_loss = F.mse_loss(source_map, pgt_map, reduction='sum')
-            # losses.update({'pgta_loss': pgta_loss * self.pgta_loss_weight})
+            pgta_loss = F.mse_loss(source_map, pgt_map, reduction='sum')
+            losses.update({'pgta_loss': pgta_loss * self.pgta_loss_weight})
 
             return losses
         else:
