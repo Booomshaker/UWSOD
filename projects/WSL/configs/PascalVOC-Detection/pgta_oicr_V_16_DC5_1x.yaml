@@ -12,14 +12,14 @@ MODEL:
   VGG:
     DEPTH: 16
     CONV5_DILATION: 2
-    OUT_FEATURES: ["plain2", "plain3", "plain4", "plain5"]
+    OUT_FEATURES: ["plain3", "plain4", "plain5"]
   PROPOSAL_GENERATOR:
     NAME: "PrecomputedProposals"
     MIN_SIZE: 20
   ROI_HEADS:
     NAME: "PGTAOICRROIHeads"
     # IN_FEATURES: ["plain5"]
-    IN_FEATURES: ["plain2", "plain3", "plain4", "plain5"]
+    IN_FEATURES: ["plain3", "plain4", "plain5"]
     NUM_CLASSES: 20
     SCORE_THRESH_TEST: 0.00001
     NMS_THRESH_TEST: 0.3
