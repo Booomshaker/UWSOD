@@ -179,6 +179,11 @@ class OICRROIHeads(ROIHeads):
             box_refinery_k = OICROutputLayers(cfg, box_head.output_shape, k)
             box_refinery.append(box_refinery_k)
 
+        if cfg.MODEL.OICR_EMA:
+            for _box_refinery in box_refinery[1:]:
+                for target_param, cur_param in zip(box_refinery[0].parameters(), _box_refinery.parameters()):
+                    cur_param.data.copy_(target_param.data)
+
         output_dir = cfg.OUTPUT_DIR
         vis_test = cfg.WSL.VIS_TEST
         vis_period = cfg.VIS_PERIOD

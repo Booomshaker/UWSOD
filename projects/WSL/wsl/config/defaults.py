@@ -69,3 +69,6 @@ def add_wsl_config(cfg):
     _C.MODEL.PGTA = CN()
     _C.MODEL.PGTA.VISUALIZE = False
     _C.MODEL.PGTA.LOSS_WEIGHT = 1.
+
+    _C.MODEL.OICR_EMA = False
+    _C.MODEL.OICR_EMA_MOMENTUM = 0.99
