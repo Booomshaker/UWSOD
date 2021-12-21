@@ -169,6 +169,18 @@ class PGTAOICRROIHeads(ROIHeads):
             sampling_ratio=sampling_ratio,
             pooler_type=pooler_type,
         )
+        # multi-scale box pooler for self-distillation
+        cls.sd_box_pooler = []
+        for _pooler_scale in [tuple([1.0 / input_shape[k].stride]) for k in in_features]:
+            cls.sd_box_pooler.append(
+                ROIPooler(
+                    output_size=pooler_resolution,
+                    scales=_pooler_scale,
+                    sampling_ratio=sampling_ratio,
+                    pooler_type=pooler_type,
+                )
+            )
+
         # Here we split "box head" and "box predictor", which is mainly due to historical reasons.
         # They are used together so the "box predictor" layers should be part of the "box head".
         # New subclasses of ROIHeads do not need "box predictor"s.
@@ -190,9 +202,11 @@ class PGTAOICRROIHeads(ROIHeads):
         vis_test = cfg.WSL.VIS_TEST
         vis_period = cfg.VIS_PERIOD
 
+        # pgta
         cls.visualize_pgta = cfg.MODEL.PGTA.VISUALIZE
         cls.pgta_loss_weight = cfg.MODEL.PGTA.LOSS_WEIGHT
         cls.cam_cls_loss_weight = 1.
+        cls.loss_lw_weight = cfg.MODEL.PGTA.LOSS_WEIGHT
 
         return {
             "box_in_features": in_features,
@@ -206,7 +220,7 @@ class PGTAOICRROIHeads(ROIHeads):
             "refine_mist": refine_mist,
             "refine_reg": refine_reg,
             "box_refinery": box_refinery,
-            "cls_agnostic_bbox_reg": cls_agnostic_bbox_reg
+            "cls_agnostic_bbox_reg": cls_agnostic_bbox_reg,
         }
 
     @classmethod
@@ -357,7 +371,6 @@ class PGTAOICRROIHeads(ROIHeads):
             In inference, a list of `Instances`, the predicted instances.
         """
         features = [features[f] for f in self.box_in_features]
-
         # pgta
         last_feats = features[-1]
 
@@ -401,14 +414,13 @@ class PGTAOICRROIHeads(ROIHeads):
             #     grad_cam[c] = _grad_cam
             # grad_cam = grad_cam.unsqueeze(0)
         
-
-        GEN_FORWARD_PGT = True
+        GEN_FORWARD_PGT = False
         if GEN_FORWARD_PGT:
             # generate forward pgt
             features_interpolate = [F.interpolate(x, last_feats.shape[2:]) for x in features]   # interpolate: list([N, d, H, W])
             features_norm = [F.normalize(x.view(x.shape[0], -1)).view(x.shape[:]) for x in features_interpolate]   # normalize
-            features_fusion = [torch.mean(x, 1, keepdim=True) for x in features_norm]   # channel-wise avg pool: list([N, 1, H, W])
-            # features_fusion = [torch.max(x, 1, keepdim=True)[0] for x in features_norm]   # channel_wise max pooling
+            # features_fusion = [torch.mean(x, 1, keepdim=True) for x in features_norm]   # channel-wise avg pool: list([N, 1, H, W])
+            features_fusion = [torch.max(x, 1, keepdim=True)[0] for x in features_norm]   # channel_wise max pool
             features_fusion = torch.cat(features_fusion, dim=1).detach()  # [N, num_stage, H, W]
             pgt_map = torch.max(features_fusion, 1, keepdim=True)[0]   # [N, 1, H, W]
 
@@ -446,6 +458,25 @@ class PGTAOICRROIHeads(ROIHeads):
                 extra_proposals.set('gt_classes', torch.stack(_extra_proposals_num * [proposals[0][0].gt_classes]).squeeze(1))
                 extra_proposals.set('gt_boxes', Boxes(torch.stack(_extra_proposals_num * [proposals[0][0].gt_boxes.tensor]).squeeze(1)))
             proposals[0] = Instances.cat([proposals[0], extra_proposals])
+            # source_map = torch.mean(last_feats_norm, 1, keepdim=True)   # channel-wise avg pool: [N, 1, H, W]
+            source_map = torch.max(last_feats_norm, 1, keepdim=True)[0]   # channel-wise max pool
+
+        SELF_DISTILL = True
+        if SELF_DISTILL:
+            sd_box_features = []
+            for _feature, _box_pooler in zip(features, self.sd_box_pooler):
+                _sd_box_feature = _box_pooler([_feature], [x.proposal_boxes for x in proposals])
+                _sd_box_feature = torch.mean(_sd_box_feature, dim=1, keepdim=True)   # [N, 1, H, W]
+                _batch_size, _, _h, _w = _sd_box_feature.shape
+                _sd_box_feature = _sd_box_feature.view(_batch_size, -1)   # [N, H*W]
+                _batch_min, _ = torch.min(_sd_box_feature, dim=-1, keepdim=True)
+                _batch_max, _ = torch.max(_sd_box_feature, dim=-1, keepdim=True)
+                _sd_box_feature = torch.div(_sd_box_feature - _batch_min, _batch_max - _batch_min + 1e-7)   # Normalize
+                _sd_box_feature = _sd_box_feature.view(_batch_size, 1, _h, _w)   # [N, 1, H, W]
+                _sd_box_feature = torch.sigmoid(_sd_box_feature)
+                sd_box_features.append(_sd_box_feature)
+            sd_box_features_pgt = torch.cat(sd_box_features, 1)   # [N, 4, H, W]
+            sd_box_features_pgt = torch.max(sd_box_features_pgt, dim=1, keepdim=True)[0].detach()   # [N, 1, H, W]
 
         box_features = self.box_pooler(features[-1:], [x.proposal_boxes for x in proposals])
         objectness_logits = torch.cat([x.objectness_logits + 1 for x in proposals], dim=0)
@@ -513,13 +544,14 @@ class PGTAOICRROIHeads(ROIHeads):
                     for proposals_per_image, pred_boxes_per_image in zip(proposals, pred_boxes):
                         proposals_per_image.proposal_boxes = Boxes(pred_boxes_per_image)
 
-            # pgta loss
-            # cam_cls_loss = F.binary_cross_entropy(cam_pred_class_logits, self.gt_classes_img_oh)
-            # pgta_loss = F.mse_loss(source_map, pgt_map, reduction='sum')
-            # losses.update({
-            #     'loss_pgta': pgta_loss * self.pgta_loss_weight, 
-            #     'loss_cam_cls': cam_cls_loss * self.cam_cls_loss_weight
-            # })
+            if GEN_FORWARD_PGT:
+                pgta_loss = F.mse_loss(source_map, pgt_map, reduction='sum')
+                losses.update({'pgta_loss': pgta_loss * self.pgta_loss_weight})
+
+            if SELF_DISTILL:
+                for i, _sd_box_feature in enumerate(sd_box_features):
+                    loss_lw = F.mse_loss(_sd_box_feature, sd_box_features_pgt, reduction='sum') / sd_box_features_pgt.shape[0]
+                    losses.update({'loss_lw{}'.format(i): loss_lw * self.loss_lw_weight})
 
             return losses
         else:

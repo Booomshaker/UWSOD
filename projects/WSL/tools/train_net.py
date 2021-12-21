@@ -49,6 +49,7 @@ from detectron2.utils.logger import setup_logger
 import wsl.data.datasets
 from wsl.config import add_wsl_config
 from wsl.modeling import GeneralizedRCNNWithTTAAVG, GeneralizedRCNNWithTTAUNION
+import pdb
 
 
 class Trainer(DefaultTrainer):
@@ -64,6 +65,9 @@ class Trainer(DefaultTrainer):
         super().__init__(cfg)
 
         self.iter_size = cfg.WSL.ITER_SIZE
+        self.oicr_ema = cfg.MODEL.OICR_EMA
+        if self.oicr_ema:
+            self.ema_m = cfg.MODEL.OICR_EMA_MOMENTUM
 
         # if comm.is_main_process():
         # self._hooks[-1]._period = cfg.WSL.ITER_SIZE * 10
@@ -116,9 +120,18 @@ class Trainer(DefaultTrainer):
 
             self.optimizer.zero_grad()
 
+        if self.oicr_ema:
+            self._oicr_ema_update()
         del losses
         del loss_dict
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _oicr_ema_update(self):
+        for param_0, param_1 in zip(self.model.module.roi_heads.box_refinery_0.parameters(), self.model.module.roi_heads.box_refinery_1.parameters()):
+            param_0.data = param_0.data * self.ema_m + param_1.data * (1. - self.ema_m)
+        for param_1, param_2 in zip(self.model.module.roi_heads.box_refinery_1.parameters(), self.model.module.roi_heads.box_refinery_2.parameters()):
+            param_1.data = param_1.data * self.ema_m + param_2.data * (1. - self.ema_m)
 
     @classmethod
     def build_train_loader(cls, cfg):
