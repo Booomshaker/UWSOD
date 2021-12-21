@@ -18,7 +18,7 @@ from detectron2.utils.events import get_event_storage
 from detectron2.utils.logger import log_first_n
 
 from ..postprocessing import detector_postprocess
-
+from skimage import measure
 import pdb
 
 __all__ = ["GeneralizedRCNNWSL", "ProposalNetworkWSL"]
@@ -265,17 +265,32 @@ class GeneralizedRCNNWSL(nn.Module):
     def draw_pgta(self, images, pgta_data):
         import os
         import cv2
+        from skimage import measure
         def _draw_heatmap(image, heatmap):
-            # heatmap = heatmap - np.min(heatmap)
-            # heatmap = heatmap / np.max(heatmap)
-            heatmap = heatmap - self.hm_min_val
-            heatmap = heatmap / self.hm_max_val
+            heatmap = heatmap - np.min(heatmap)
+            heatmap = heatmap / np.max(heatmap)
             heatmap = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)   # 将热力图分散到rgb通道
-            print(heatmap.max())
             img_with_hm = np.float32(heatmap) / 255 + np.float32(image) / 255
             img_with_hm = img_with_hm / np.max(img_with_hm)
             img_with_hm = np.uint8(255 * img_with_hm)
             return img_with_hm
+        
+        def _draw_rectangle(image, heatmap):
+            _area_thres = (heatmap.shape[0] * heatmap.shape[1]) / 100
+            _num_stride = 10
+            _start = heatmap.mean()
+            _stride = (heatmap.max()-_start) / _num_stride
+            for i in range(_num_stride):
+                thres = i * _stride + _start
+                mask = np.where(heatmap > thres, 1, 0)
+                labels = measure.label(mask, connectivity=2)
+                regions = measure.regionprops(labels)
+                for region in regions:
+                    if region.area < _area_thres:
+                        continue
+                    y1, x1, y2, x2 = region.bbox
+                    cv2.rectangle(image, (x1, y1), (x2-1, y2-1), (0, 255, 0), 1)
+            return image
 
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
@@ -290,18 +305,18 @@ class GeneralizedRCNNWSL(nn.Module):
         
         source_map = pgta_data['source_map'].detach()
         pgt_map = pgta_data['pgt_map'].detach()
-        self.hm_max_val = max(torch.max(source_map).item(), torch.max(pgt_map).item())
-        self.hm_min_val = min(torch.min(source_map).item(), torch.min(pgt_map).item())
 
-        source_map = F.interpolate(source_map, (im_h, im_w)).squeeze().cpu().numpy()
-        source_hm = _draw_heatmap(im, source_map)
-        cv2.imwrite(os.path.join(self.output_dir, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
+        # source_map = F.interpolate(source_map, (im_h, im_w)).squeeze().cpu().numpy()
+        # source_hm = _draw_heatmap(im, source_map)
+        # cv2.imwrite(os.path.join(self.output_dir, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
         
         pgt_map = F.interpolate(pgt_map, (im_h, im_w)).squeeze().cpu().numpy()
+        proposal_img = _draw_rectangle(im, pgt_map)
+        cv2.imwrite(os.path.join(self.output_dir, 'bbox_{}.jpg'.format(self.image_cnt)), proposal_img)
         pgt_hm = _draw_heatmap(im, pgt_map)
         cv2.imwrite(os.path.join(self.output_dir, 'pgt_{}.jpg'.format(self.image_cnt)), pgt_hm)
         self.image_cnt += 1
-        pdb.set_trace()
+        # pdb.set_trace()
 
 
     def preprocess_image(self, batched_inputs):

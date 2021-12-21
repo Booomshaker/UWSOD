@@ -30,6 +30,8 @@ from wsl.modeling.roi_heads.roi_heads import (
     select_proposals_with_visible_keypoints,
 )
 
+from skimage import measure
+
 import pdb
 
 logger = logging.getLogger(__name__)
@@ -190,6 +192,7 @@ class PGTAOICRROIHeads(ROIHeads):
 
         cls.visualize_pgta = cfg.MODEL.PGTA.VISUALIZE
         cls.pgta_loss_weight = cfg.MODEL.PGTA.LOSS_WEIGHT
+        cls.cam_cls_loss_weight = 1.
 
         return {
             "box_in_features": in_features,
@@ -363,38 +366,40 @@ class PGTAOICRROIHeads(ROIHeads):
         if GEN_BACKWARD_PGT:
             x = F.avg_pool2d(last_feats, kernel_size=(last_feats.shape[2], last_feats.shape[3]), padding=0)
             cam_pred_class_logits = self.cls_fc(x)
-            # calculate cam
-            cam = F.conv2d(last_feats, self.cls_fc.weight)
-            cam = F.relu(cam)
-            # calculate grad-cam
-            grad_cam = torch.zeros(
-                (self.num_classes, last_feats.shape[2], last_feats.shape[3]),
-                dtype=last_feats.dtype,
-                device=last_feats.device
-            )
-            for c in range(self.num_classes):
-                if self.gt_classes_img_oh[0, c] < 0.5:
-                    continue
-                grad_outputs = torch.zeros(
-                    cam_pred_class_logits.size(),
-                    dtype=last_feats.dtype,
-                    device=last_feats.device
-                )
-                grad_outputs[:, c] = 1.0
-                grad_val, = torch.autograd.grad(
-                    outputs=cam_pred_class_logits,
-                    inputs=last_feats,
-                    grad_outputs=grad_outputs,
-                    retain_graph=True,
-                    create_graph=False
-                )
-                weight = torch.mean(grad_val, (2, 3))
-                weight = weight.view(1, -1 , 1, 1)
-                _grad_cam = weight * last_feats
-                _grad_cam = torch.sum(_grad_cam, 1)
-                _grad_cam = F.relu(_grad_cam)[0]
-                grad_cam[c] = _grad_cam
-            grad_cam = grad_cam.unsqueeze(0)
+            cam_pred_class_logits = cam_pred_class_logits.view(cam_pred_class_logits.shape[:2])
+            cam_pred_class_logits = torch.sigmoid(cam_pred_class_logits)
+            # # calculate cam
+            # cam = F.conv2d(last_feats, self.cls_fc.weight)
+            # cam = F.relu(cam)
+            # # calculate grad-cam
+            # grad_cam = torch.zeros(
+            #     (self.num_classes, last_feats.shape[2], last_feats.shape[3]),
+            #     dtype=last_feats.dtype,
+            #     device=last_feats.device
+            # )
+            # for c in range(self.num_classes):
+            #     if self.gt_classes_img_oh[0, c] < 0.5:
+            #         continue
+            #     grad_outputs = torch.zeros(
+            #         cam_pred_class_logits.size(),
+            #         dtype=last_feats.dtype,
+            #         device=last_feats.device
+            #     )
+            #     grad_outputs[:, c] = 1.0
+            #     grad_val, = torch.autograd.grad(
+            #         outputs=cam_pred_class_logits,
+            #         inputs=last_feats,
+            #         grad_outputs=grad_outputs,
+            #         retain_graph=True,
+            #         create_graph=False
+            #     )
+            #     weight = torch.mean(grad_val, (2, 3))
+            #     weight = weight.view(1, -1 , 1, 1)
+            #     _grad_cam = weight * last_feats
+            #     _grad_cam = torch.sum(_grad_cam, 1)
+            #     _grad_cam = F.relu(_grad_cam)[0]
+            #     grad_cam[c] = _grad_cam
+            # grad_cam = grad_cam.unsqueeze(0)
         
 
         GEN_FORWARD_PGT = True
@@ -411,9 +416,38 @@ class PGTAOICRROIHeads(ROIHeads):
             source_map = torch.mean(last_feats_norm, 1, keepdim=True)   # channel-wise avg pool: [N, 1, H, W]
             # source_map = torch.max(last_feats_norm, 1, keepdim=True)[0]   # channel-wise max pool
 
+        GEN_EXTRA_PROPOSAL = True
+        if GEN_EXTRA_PROPOSAL:
+            _heatmap = F.interpolate(pgt_map, proposals[0].image_size).squeeze().cpu().numpy()
+            _area = _heatmap.shape[0] * _heatmap.shape[1]
+            _start_val = _heatmap.mean()
+            _num_stride = 10
+            _stride_val = (_heatmap.max() - _start_val) / _num_stride
+            _extra_proposals = []
+            for i in range(_num_stride):
+                _thres = i * _stride_val + _start_val
+                _mask = np.where(_heatmap > _thres, 1, 0)
+                _labels1 = measure.label(_mask, connectivity=1)
+                _regions1 = measure.regionprops(_labels1)
+                _labels2 = measure.label(_mask, connectivity=2)
+                _regions2 = measure.regionprops(_labels2)
+                _regions = _regions1 + _regions2
+                for _region in _regions:
+                    if 0.005 * _area < _region.area < 0.95 * _area:
+                        y1, x1, y2, x2 = _region.bbox
+                        _extra_proposals.append(torch.tensor([x1, y1, x2, y2]))
+            _extra_proposals = torch.stack(_extra_proposals)
+            _extra_proposals = _extra_proposals.float().to(last_feats.device)
+            _extra_proposals_num = len(_extra_proposals)
+            extra_proposals = Instances(proposals[0].image_size)
+            extra_proposals.set('proposal_boxes', Boxes(_extra_proposals))
+            extra_proposals.set('objectness_logits', torch.stack(_extra_proposals_num * [proposals[0][0].objectness_logits]).squeeze(1))
+            if self.training:
+                extra_proposals.set('gt_classes', torch.stack(_extra_proposals_num * [proposals[0][0].gt_classes]).squeeze(1))
+                extra_proposals.set('gt_boxes', Boxes(torch.stack(_extra_proposals_num * [proposals[0][0].gt_boxes.tensor]).squeeze(1)))
+            proposals[0] = Instances.cat([proposals[0], extra_proposals])
 
         box_features = self.box_pooler(features[-1:], [x.proposal_boxes for x in proposals])
-
         objectness_logits = torch.cat([x.objectness_logits + 1 for x in proposals], dim=0)
         box_features = box_features * objectness_logits.view(-1, 1, 1, 1)
         if self.training:
@@ -423,7 +457,6 @@ class PGTAOICRROIHeads(ROIHeads):
             storage.put_scalar("proposals/objectness_logits+1 min", objectness_logits.min())
 
         torch.cuda.empty_cache()
-
         box_features = self.box_head(box_features)
         predictions = self.box_predictor(box_features, proposals)
         # del box_features
@@ -481,9 +514,12 @@ class PGTAOICRROIHeads(ROIHeads):
                         proposals_per_image.proposal_boxes = Boxes(pred_boxes_per_image)
 
             # pgta loss
-            
-            pgta_loss = F.mse_loss(source_map, pgt_map, reduction='sum')
-            losses.update({'pgta_loss': pgta_loss * self.pgta_loss_weight})
+            # cam_cls_loss = F.binary_cross_entropy(cam_pred_class_logits, self.gt_classes_img_oh)
+            # pgta_loss = F.mse_loss(source_map, pgt_map, reduction='sum')
+            # losses.update({
+            #     'loss_pgta': pgta_loss * self.pgta_loss_weight, 
+            #     'loss_cam_cls': cam_cls_loss * self.cam_cls_loss_weight
+            # })
 
             return losses
         else:
