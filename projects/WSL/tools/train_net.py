@@ -128,9 +128,9 @@ class Trainer(DefaultTrainer):
 
     @torch.no_grad()
     def _oicr_ema_update(self):
-        for param_0, param_1 in zip(self.model.roi_heads.box_refinery_0.parameters(), self.model.roi_heads.box_refinery_1.parameters()):
+        for param_0, param_1 in zip(self.model.module.roi_heads.box_refinery_0.parameters(), self.model.module.roi_heads.box_refinery_1.parameters()):
             param_0.data = param_0.data * self.ema_m + param_1.data * (1. - self.ema_m)
-        for param_1, param_2 in zip(self.model.roi_heads.box_refinery_1.parameters(), self.model.roi_heads.box_refinery_2.parameters()):
+        for param_1, param_2 in zip(self.model.module.roi_heads.box_refinery_1.parameters(), self.model.module.roi_heads.box_refinery_2.parameters()):
             param_1.data = param_1.data * self.ema_m + param_2.data * (1. - self.ema_m)
 
     @classmethod
