@@ -19,6 +19,9 @@ from detectron2.utils.logger import log_first_n
 
 from ..postprocessing import detector_postprocess
 from skimage import measure
+import os
+import cv2
+
 import pdb
 
 __all__ = ["GeneralizedRCNNWSL", "ProposalNetworkWSL"]
@@ -81,9 +84,11 @@ class GeneralizedRCNNWSL(nn.Module):
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
         cls.visualize_pgta = cfg.MODEL.PGTA.VISUALIZE
-        if cls.visualize_pgta:
+        cls.visualize_pua = cfg.MODEL.PUA.VISUALIZE
+        if cls.visualize_pgta or cls.visualize_pua:
             cls.image_cnt = 0
-        cls.output_dir = cfg.MODEL.WEIGHTS.split(".")[0] + "_pgta"
+            cls.output_dir_pgta = cfg.MODEL.WEIGHTS.split(".")[0] + "_pgta"
+            cls.output_dir_pua = cfg.MODEL.WEIGHTS.split(".")[0] + "_pua"
         return {
             "backbone": backbone,
             "proposal_generator": build_proposal_generator(cfg, backbone.output_shape()),
@@ -248,7 +253,9 @@ class GeneralizedRCNNWSL(nn.Module):
             if self.visualize_pgta:
                 results, _, all_scores, all_boxes, pgta_data = self.roi_heads(images, features, proposals, None)
                 self.draw_pgta(images, pgta_data)
-
+            if self.visualize_pua:
+                results, _, all_scores, all_boxes, pua_data = self.roi_heads(images, features, proposals, None)
+                self.draw_pua(images, pua_data)
             else:
                 results, _, all_scores, all_boxes = self.roi_heads(images, features, proposals, None)
         else:
@@ -263,9 +270,6 @@ class GeneralizedRCNNWSL(nn.Module):
             return results, all_scores, all_boxes
 
     def draw_pgta(self, images, pgta_data):
-        import os
-        import cv2
-        from skimage import measure
         def _draw_heatmap(image, heatmap):
             heatmap = heatmap - np.min(heatmap)
             heatmap = heatmap / np.max(heatmap)
@@ -292,8 +296,8 @@ class GeneralizedRCNNWSL(nn.Module):
                     cv2.rectangle(image, (x1, y1), (x2-1, y2-1), (0, 255, 0), 1)
             return image
 
-        if not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir)
+        if not os.path.exists(self.output_dir_pgta):
+            os.makedirs(self.output_dir_pgta)
 
         im = images.tensor[0, ...].clone().detach().cpu().numpy()
         im_w, im_h = images.image_sizes[0][1], images.image_sizes[0][0]
@@ -308,16 +312,40 @@ class GeneralizedRCNNWSL(nn.Module):
 
         # source_map = F.interpolate(source_map, (im_h, im_w)).squeeze().cpu().numpy()
         # source_hm = _draw_heatmap(im, source_map)
-        # cv2.imwrite(os.path.join(self.output_dir, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
+        # cv2.imwrite(os.path.join(self.output_dir_pgta, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
         
         pgt_map = F.interpolate(pgt_map, (im_h, im_w)).squeeze().cpu().numpy()
         proposal_img = _draw_rectangle(im, pgt_map)
-        cv2.imwrite(os.path.join(self.output_dir, 'bbox_{}.jpg'.format(self.image_cnt)), proposal_img)
+        cv2.imwrite(os.path.join(self.output_dir_pgta, 'bbox_{}.jpg'.format(self.image_cnt)), proposal_img)
         pgt_hm = _draw_heatmap(im, pgt_map)
-        cv2.imwrite(os.path.join(self.output_dir, 'pgt_{}.jpg'.format(self.image_cnt)), pgt_hm)
+        cv2.imwrite(os.path.join(self.output_dir_pgta, 'pgt_{}.jpg'.format(self.image_cnt)), pgt_hm)
         self.image_cnt += 1
-        # pdb.set_trace()
 
+    def draw_pua(self, images, pua_data):
+        if not os.path.exists(self.output_dir_pua):
+            os.makedirs(self.output_dir_pua)
+
+        im = images.tensor[0, ...].clone().detach().cpu().numpy()
+        im_w, im_h = images.image_sizes[0][1], images.image_sizes[0][0]
+        im = im.transpose((1, 2, 0))
+        pixel_means = [102.9801, 115.9465, 122.7717]
+        im += pixel_means
+        im = np.ascontiguousarray(im)
+        im = im.astype(np.uint8)
+
+        box_weight = pua_data['box_weight'].cpu().numpy()
+        box_pos = pua_data['box_pos'].cpu().numpy()   # [x1, y1, x2, y2]
+
+        top_boxes = box_pos[np.where(box_weight > 1.9)[0]]
+        bot_boxes = box_pos[np.where(box_weight < 1.1)[0]]
+
+        for x1, y1, x2, y2 in top_boxes:
+            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 255, 0), 1)
+        for x1, y1, x2, y2 in bot_boxes:
+            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (255, 0, 0), 1)
+        cv2.imwrite(os.path.join(self.output_dir_pua, 'pua_{}.jpg'.format(self.image_cnt)), im)
+        self.image_cnt += 1
+        pdb.set_trace()
 
     def preprocess_image(self, batched_inputs):
         """

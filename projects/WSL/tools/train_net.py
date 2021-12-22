@@ -65,6 +65,7 @@ class Trainer(DefaultTrainer):
         super().__init__(cfg)
 
         self.iter_size = cfg.WSL.ITER_SIZE
+        # ema
         self.oicr_ema = cfg.MODEL.OICR_EMA
         if self.oicr_ema:
             self.ema_m = cfg.MODEL.OICR_EMA_MOMENTUM

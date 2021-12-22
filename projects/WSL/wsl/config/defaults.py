@@ -70,5 +70,10 @@ def add_wsl_config(cfg):
     _C.MODEL.PGTA.VISUALIZE = False
     _C.MODEL.PGTA.LOSS_WEIGHT = 1.
 
+    _C.MODEL.PUA = CN()
+    _C.MODEL.PUA.VISUALIZE = False
+    _C.MODEL.PUA.START_ITER = 100000  # 2 gpu / half epoch
+    _C.MODEL.PUA.WEIGHT_REVERSE = True
+    
     _C.MODEL.OICR_EMA = False
     _C.MODEL.OICR_EMA_MOMENTUM = 0.99
