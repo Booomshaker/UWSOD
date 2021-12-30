@@ -30,6 +30,7 @@ from wsl.modeling.roi_heads.roi_heads import (
 )
 
 import pdb
+import math
 logger = logging.getLogger(__name__)
 
 
@@ -189,6 +190,8 @@ class PUAOICRROIHeads(ROIHeads):
         cls.visualize_pua = cfg.MODEL.PUA.VISUALIZE
         cls.pua_start_iter = cfg.MODEL.PUA.START_ITER
         cls.pua_weight_reverse = cfg.MODEL.PUA.WEIGHT_REVERSE
+        cls.pua_normal_box_logit = cfg.MODEL.PUA.NORMAL_BOX_LOGIT
+        cls.pua_oicr_softmax = cfg.MODEL.PUA.OICR_INFER_SOFTMAX
 
         return {
             "box_in_features": in_features,
@@ -270,7 +273,6 @@ class PUAOICRROIHeads(ROIHeads):
         self.gt_classes_img, self.gt_classes_img_int, self.gt_classes_img_oh = get_image_level_gt(
             targets, self.num_classes
         )
-
         # del images
         self.images = images
         if self.training:
@@ -335,23 +337,43 @@ class PUAOICRROIHeads(ROIHeads):
 
     @torch.no_grad()
     def _calculate_box_weight(self, _box_features, proposals):
-        _pred_scores = []
-        for _ in range(5):
-            _box_features_drop = F.dropout(_box_features, p=0.5)
-            _box_features_drop = self.box_head(_box_features_drop)
-            _pred_score, _ = self.box_predictor(_box_features_drop, proposals)
-            _pred_scores.append(_pred_score)
-        _pred_scores = torch.stack(_pred_scores)
-        _pred_scores_var = torch.var(_pred_scores, dim=0)
-        _box_var = torch.sum(_pred_scores_var, 1)
-        _box_weight = -torch.log(_box_var)
-        _box_weight = torch.clamp(_box_weight, 1e-6, 100.)
-        _box_weight_min, _box_weight_max = torch.min(_box_weight), torch.max(_box_weight)
-        _box_weight = (_box_weight - _box_weight_min) / (_box_weight_max - _box_weight_min)
-        if self.pua_weight_reverse:
-            _box_weight = 1.5 - _box_weight   # 两级反转
-        else:
-            _box_weight = 0.5 + _box_weight
+        _cal_uc_mode = 'oicr_infer'
+        if _cal_uc_mode == 'wsddn_infer_5':
+            _pred_scores = []
+            for _ in range(5):
+                _box_features_drop = F.dropout(_box_features, p=0.5)
+                _box_features_drop = self.box_head(_box_features_drop)
+                _pred_score, _ = self.box_predictor(_box_features_drop, proposals)
+                _pred_scores.append(_pred_score)
+            _pred_scores = torch.stack(_pred_scores)
+            _pred_scores_var = torch.var(_pred_scores, dim=0)
+            _box_var = torch.sum(_pred_scores_var, 1)
+            _box_weight = -torch.log(_box_var)
+            _box_weight = torch.clamp(_box_weight, 1e-6, 100.)
+            _box_weight_min, _box_weight_max = torch.min(_box_weight), torch.max(_box_weight)
+            _box_weight = (_box_weight - _box_weight_min) / (_box_weight_max - _box_weight_min)
+            if self.pua_weight_reverse:
+                _box_weight = 1 - _box_weight   # 两级反转
+
+        if _cal_uc_mode == 'oicr_infer':
+            _gt_classes = torch.unique(self.gt_classes_img_int[0])
+            _box_features = self.box_head(_box_features)
+            _pred_scores = []
+            for _refinery in self.box_refinery:
+                _pred_score, _ = _refinery(_box_features)
+                _pred_scores.append(_pred_score)
+            _pred_scores = torch.stack(_pred_scores)
+            if self.pua_oicr_softmax:
+                _pred_scores = torch.softmax(_pred_scores[:, :, :-1], -1)   # TODO softmax
+                _pred_scores = torch.clamp(_pred_scores, min=1e-6, max=1.0 - 1e-6)
+            _pred_scores = torch.index_select(_pred_scores, -1, _gt_classes)   # select gt columns
+            _pred_scores_var = torch.var(_pred_scores, dim=0)   # calculate uncertainty via varience
+            _box_var = torch.mean(_pred_scores_var, 1)   # calculate varience of predict scores
+            _box_var = torch.clamp(_box_var, min=1e-6)
+            _box_weight = -torch.log(_box_var)
+            _box_weight *= torch.mean(_pred_scores, (0, 2))   # dot logit
+            _box_weight_min, _box_weight_max = torch.min(_box_weight), torch.max(_box_weight)
+            _box_weight = (_box_weight - _box_weight_min) / (_box_weight_max - _box_weight_min)
         return _box_weight
 
     def _forward_box(
@@ -392,7 +414,15 @@ class PUAOICRROIHeads(ROIHeads):
                 print('---------')
             _box_features = box_features.clone().detach()
             _box_weight = self._calculate_box_weight(_box_features, proposals)
-            box_features = box_features * _box_weight.view(-1, 1, 1, 1)
+            _object_logit = objectness_logits
+            if self.pua_normal_box_logit:
+                _object_logit_max, _object_logit_min = torch.max(objectness_logits), torch.min(objectness_logits)
+                _object_logit = (objectness_logits - _object_logit_min) / (_object_logit_max - _object_logit_min)
+            _box_logit_weight = _object_logit * _box_weight
+            _box_logit_weight_max, _box_logit_weight_min = torch.max(_box_logit_weight), torch.min(_box_logit_weight)
+            _box_logit_weight = (_box_logit_weight - _box_logit_weight_min) / (_box_logit_weight_max - _box_logit_weight_min)
+            _box_logit_weight += 1
+            box_features = box_features * _box_logit_weight.view(-1, 1, 1, 1)
 
         box_features = self.box_head(box_features)
         predictions = self.box_predictor(box_features, proposals)
@@ -469,7 +499,8 @@ class PUAOICRROIHeads(ROIHeads):
             if self.visualize_pua:
                 pua_data = {
                     'box_pos': proposals[0].proposal_boxes.tensor,
-                    'box_weight': _box_weight
+                    'box_weight': _box_weight,
+                    'box_logit': _object_logit
                 }
                 return pred_instances, all_scores, all_boxes, pua_data
             return pred_instances, all_scores, all_boxes

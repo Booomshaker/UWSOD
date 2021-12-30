@@ -254,7 +254,8 @@ class GeneralizedRCNNWSL(nn.Module):
                 results, _, all_scores, all_boxes, pgta_data = self.roi_heads(images, features, proposals, None)
                 self.draw_pgta(images, pgta_data)
             if self.visualize_pua:
-                results, _, all_scores, all_boxes, pua_data = self.roi_heads(images, features, proposals, None)
+                gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+                results, _, all_scores, all_boxes, pua_data = self.roi_heads(images, features, proposals, gt_instances)
                 self.draw_pua(images, pua_data)
             else:
                 results, _, all_scores, all_boxes = self.roi_heads(images, features, proposals, None)
@@ -335,17 +336,30 @@ class GeneralizedRCNNWSL(nn.Module):
 
         box_weight = pua_data['box_weight'].cpu().numpy()
         box_pos = pua_data['box_pos'].cpu().numpy()   # [x1, y1, x2, y2]
+        box_logit = pua_data['box_logit'].cpu().numpy()
 
-        top_boxes = box_pos[np.where(box_weight > 1.9)[0]]
-        bot_boxes = box_pos[np.where(box_weight < 1.1)[0]]
+        # box_weight
+        # for x1, y1, x2, y2 in box_pos[np.where(box_weight > 0.9)[0]]:
+        #     cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 0, 255), 1)   # red
+        # for x1, y1, x2, y2 in box_pos[np.where(box_weight < 0.1)[0]]:
+        #     cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (255, 0, 0), 1)   # blue
 
-        for x1, y1, x2, y2 in top_boxes:
-            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 255, 0), 1)
-        for x1, y1, x2, y2 in bot_boxes:
-            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (255, 0, 0), 1)
-        cv2.imwrite(os.path.join(self.output_dir_pua, 'pua_{}.jpg'.format(self.image_cnt)), im)
+        # box_logit
+        # for x1, y1, x2, y2 in box_pos[np.where(box_logit < 1.)[0]]:
+        #     cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 255, 0), 1)   # green
+
+        # box_logit_weight
+        box_lw = box_logit * box_weight
+        box_lw_min, box_lw_max = np.min(box_lw), np.max(box_lw)
+        box_lw = (box_lw - box_lw_min) / (box_lw_max - box_lw_min)
+        for x1, y1, x2, y2 in box_pos[np.where(box_lw > 0.9)[0]]:
+            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 255, 255), 1)   # yellow
+
+        cv2.imwrite(os.path.join(self.output_dir_pua, 'pua_{}_oicr_gt_softmax.jpg'.format(self.image_cnt)), im)
         self.image_cnt += 1
-        pdb.set_trace()
+        if self.image_cnt > 20:
+            exit(0)
+        # pdb.set_trace()
 
     def preprocess_image(self, batched_inputs):
         """

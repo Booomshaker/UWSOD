@@ -74,6 +74,8 @@ def add_wsl_config(cfg):
     _C.MODEL.PUA.VISUALIZE = False
     _C.MODEL.PUA.START_ITER = 100000  # 2 gpu / half epoch
     _C.MODEL.PUA.WEIGHT_REVERSE = True
+    _C.MODEL.PUA.NORMAL_BOX_LOGIT = False
+    _C.MODEL.PUA.OICR_INFER_SOFTMAX = False
     
     _C.MODEL.OICR_EMA = False
     _C.MODEL.OICR_EMA_MOMENTUM = 0.99
