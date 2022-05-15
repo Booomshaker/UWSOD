@@ -414,21 +414,19 @@ class PGTAOICRROIHeads(ROIHeads):
             #     grad_cam[c] = _grad_cam
             # grad_cam = grad_cam.unsqueeze(0)
         
-        GEN_FORWARD_PGT = False
+        GEN_FORWARD_PGT = True
         if GEN_FORWARD_PGT:
             # generate forward pgt
             features_interpolate = [F.interpolate(x, last_feats.shape[2:]) for x in features]   # interpolate: list([N, d, H, W])
             features_norm = [F.normalize(x.view(x.shape[0], -1)).view(x.shape[:]) for x in features_interpolate]   # normalize
-            # features_fusion = [torch.mean(x, 1, keepdim=True) for x in features_norm]   # channel-wise avg pool: list([N, 1, H, W])
-            features_fusion = [torch.max(x, 1, keepdim=True)[0] for x in features_norm]   # channel_wise max pool
+            features_fusion = [torch.mean(x, 1, keepdim=True) for x in features_norm]   # channel-wise avg pool: list([N, 1, H, W])
             features_fusion = torch.cat(features_fusion, dim=1).detach()  # [N, num_stage, H, W]
             pgt_map = torch.max(features_fusion, 1, keepdim=True)[0]   # [N, 1, H, W]
 
             last_feats_norm = F.normalize(last_feats.view(last_feats.shape[0], -1)).view(last_feats.shape[:])   # last feature map normalize: [N, d, H, W]
             source_map = torch.mean(last_feats_norm, 1, keepdim=True)   # channel-wise avg pool: [N, 1, H, W]
-            # source_map = torch.max(last_feats_norm, 1, keepdim=True)[0]   # channel-wise max pool
 
-        GEN_EXTRA_PROPOSAL = True
+        GEN_EXTRA_PROPOSAL = False
         if GEN_EXTRA_PROPOSAL:
             _heatmap = F.interpolate(pgt_map, proposals[0].image_size).squeeze().cpu().numpy()
             _area = _heatmap.shape[0] * _heatmap.shape[1]
@@ -461,7 +459,7 @@ class PGTAOICRROIHeads(ROIHeads):
             # source_map = torch.mean(last_feats_norm, 1, keepdim=True)   # channel-wise avg pool: [N, 1, H, W]
             source_map = torch.max(last_feats_norm, 1, keepdim=True)[0]   # channel-wise max pool
 
-        SELF_DISTILL = True
+        SELF_DISTILL = False
         if SELF_DISTILL:
             sd_box_features = []
             for _feature, _box_pooler in zip(features, self.sd_box_pooler):
@@ -572,7 +570,8 @@ class PGTAOICRROIHeads(ROIHeads):
             if self.visualize_pgta:
                 pgta_data = {
                     'source_map': source_map,
-                    'pgt_map': pgt_map
+                    'pgt_map': pgt_map,
+                    'features_norm': features_norm
                 }
                 return pred_instances, all_scores, all_boxes, pgta_data
             return pred_instances, all_scores, all_boxes

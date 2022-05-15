@@ -253,7 +253,7 @@ class GeneralizedRCNNWSL(nn.Module):
             if self.visualize_pgta:
                 results, _, all_scores, all_boxes, pgta_data = self.roi_heads(images, features, proposals, None)
                 self.draw_pgta(images, pgta_data)
-            if self.visualize_pua:
+            elif self.visualize_pua:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 results, _, all_scores, all_boxes, pua_data = self.roi_heads(images, features, proposals, gt_instances)
                 self.draw_pua(images, pua_data)
@@ -271,14 +271,15 @@ class GeneralizedRCNNWSL(nn.Module):
             return results, all_scores, all_boxes
 
     def draw_pgta(self, images, pgta_data):
-        def _draw_heatmap(image, heatmap):
-            heatmap = heatmap - np.min(heatmap)
-            heatmap = heatmap / np.max(heatmap)
-            heatmap = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)   # 将热力图分散到rgb通道
-            img_with_hm = np.float32(heatmap) / 255 + np.float32(image) / 255
+        def _draw_heatmap(image, heatmap, normal_inform={}):
+            min_hm, max_hm = normal_inform.get('min_hm', np.min(heatmap)), normal_inform.get('max_hm', np.max(heatmap))
+            heatmap = heatmap - min_hm
+            heatmap = heatmap / max_hm
+            heatmap_to_rgb = cv2.applyColorMap(np.uint8(255 * heatmap), cv2.COLORMAP_JET)   # 将热力图分散到rgb通道
+            img_with_hm = np.float32(heatmap_to_rgb) / 255 + np.float32(image) / 255
             img_with_hm = img_with_hm / np.max(img_with_hm)
             img_with_hm = np.uint8(255 * img_with_hm)
-            return img_with_hm
+            return img_with_hm, heatmap
         
         def _draw_rectangle(image, heatmap):
             _area_thres = (heatmap.shape[0] * heatmap.shape[1]) / 100
@@ -299,6 +300,10 @@ class GeneralizedRCNNWSL(nn.Module):
 
         if not os.path.exists(self.output_dir_pgta):
             os.makedirs(self.output_dir_pgta)
+        
+        self.image_cnt += 1
+        if self.image_cnt != 8:
+            return
 
         im = images.tensor[0, ...].clone().detach().cpu().numpy()
         im_w, im_h = images.image_sizes[0][1], images.image_sizes[0][0]
@@ -310,17 +315,41 @@ class GeneralizedRCNNWSL(nn.Module):
         
         source_map = pgta_data['source_map'].detach()
         pgt_map = pgta_data['pgt_map'].detach()
-
-        # source_map = F.interpolate(source_map, (im_h, im_w)).squeeze().cpu().numpy()
-        # source_hm = _draw_heatmap(im, source_map)
-        # cv2.imwrite(os.path.join(self.output_dir_pgta, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
+        all_map = pgta_data['features_norm']
+        all_map = [torch.mean(x, 1, keepdim=True) for x in all_map]
         
         pgt_map = F.interpolate(pgt_map, (im_h, im_w)).squeeze().cpu().numpy()
-        proposal_img = _draw_rectangle(im, pgt_map)
-        cv2.imwrite(os.path.join(self.output_dir_pgta, 'bbox_{}.jpg'.format(self.image_cnt)), proposal_img)
-        pgt_hm = _draw_heatmap(im, pgt_map)
-        cv2.imwrite(os.path.join(self.output_dir_pgta, 'pgt_{}.jpg'.format(self.image_cnt)), pgt_hm)
-        self.image_cnt += 1
+        normal_inform = {
+            'max_hm': np.max(pgt_map),
+            'min_hm': np.min(pgt_map)
+        }
+        all_map = [F.interpolate(x, (im_h, im_w)).squeeze().cpu().numpy() for x in all_map]
+
+
+        # proposal_img = _draw_rectangle(np.copy(im), pgt_map)
+        # cv2.imwrite(os.path.join(self.output_dir_pgta, 'bbox_{}.jpg'.format(self.image_cnt)), proposal_img)
+
+        # pgt_hm = _draw_heatmap(np.copy(im), pgt_map, normal_inform)
+        # cv2.imwrite(os.path.join(self.output_dir_pgta, 'pgt_{}.jpg'.format(self.image_cnt)), pgt_hm)
+
+        fusion_hm = []
+        for i, cur_map in enumerate(all_map):
+            cur_img_with_hm, cur_hm = _draw_heatmap(np.copy(im), cur_map)
+            fusion_hm.append(cur_hm)
+            cv2.imwrite(os.path.join(self.output_dir_pgta, 'sep_{}_{}.jpg'.format(self.image_cnt, i)), cur_img_with_hm)
+        fusion_hm = np.stack(fusion_hm)
+        fusion_hm = np.max(fusion_hm, 0)
+        heatmap_to_rgb = cv2.applyColorMap(np.uint8(255 * fusion_hm), cv2.COLORMAP_JET)   # 将热力图分散到rgb通道
+        img_with_hm = np.float32(heatmap_to_rgb) / 255 + np.float32(im) / 255
+        img_with_hm = img_with_hm / np.max(img_with_hm)
+        img_with_hm = np.uint8(255 * img_with_hm)
+        cv2.imwrite(os.path.join(self.output_dir_pgta, 'fusion_{}.jpg'.format(self.image_cnt)), img_with_hm)
+
+        # source_map = F.interpolate(source_map, (im_h, im_w)).squeeze().cpu().numpy()
+        # source_hm = _draw_heatmap(np.copy(im), source_map, normal_inform)
+        # cv2.imwrite(os.path.join(self.output_dir_pgta, 'source_{}.jpg'.format(self.image_cnt)), source_hm)
+        exit(0)
+        
 
     def draw_pua(self, images, pua_data):
         if not os.path.exists(self.output_dir_pua):
@@ -338,6 +367,11 @@ class GeneralizedRCNNWSL(nn.Module):
         box_pos = pua_data['box_pos'].cpu().numpy()   # [x1, y1, x2, y2]
         box_logit = pua_data['box_logit'].cpu().numpy()
 
+        for x1, y1, x2, y2 in box_pos:
+            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 0, 255), 1)   # red
+        cv2.imwrite('/home/lianfeihong/UWSOD/drawdraw/000001_all_box.jpg', im)
+        exit(0)
+
         # box_weight
         # for x1, y1, x2, y2 in box_pos[np.where(box_weight > 0.9)[0]]:
         #     cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 0, 255), 1)   # red
@@ -352,12 +386,14 @@ class GeneralizedRCNNWSL(nn.Module):
         box_lw = box_logit * box_weight
         box_lw_min, box_lw_max = np.min(box_lw), np.max(box_lw)
         box_lw = (box_lw - box_lw_min) / (box_lw_max - box_lw_min)
-        for x1, y1, x2, y2 in box_pos[np.where(box_lw > 0.9)[0]]:
-            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 255, 255), 1)   # yellow
+        for x1, y1, x2, y2 in box_pos[np.where(box_lw > 0.8)[0]]:
+            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 255, 0), 2)   # yellow
+        for x1, y1, x2, y2 in box_pos[np.where(box_lw < 0.14)[0]]:
+            cv2.rectangle(im, (int(x1), int(y1)), (int(x2)-1, int(y2)-1), (0, 0, 255), 2)
 
-        cv2.imwrite(os.path.join(self.output_dir_pua, 'pua_{}_oicr_gt_softmax.jpg'.format(self.image_cnt)), im)
+        cv2.imwrite(os.path.join(self.output_dir_pua, 'pua_{}_wsddn_mcdrop.jpg'.format(self.image_cnt)), im)
         self.image_cnt += 1
-        if self.image_cnt > 20:
+        if self.image_cnt > 30:
             exit(0)
         # pdb.set_trace()
 

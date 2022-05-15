@@ -337,8 +337,8 @@ class PUAOICRROIHeads(ROIHeads):
 
     @torch.no_grad()
     def _calculate_box_weight(self, _box_features, proposals):
-        _cal_uc_mode = 'oicr_infer'
-        if _cal_uc_mode == 'wsddn_infer_5':
+        _cal_uc_mode = 'wsddn_mcdrop'
+        if _cal_uc_mode == 'wsddn_mcdrop':
             _pred_scores = []
             for _ in range(5):
                 _box_features_drop = F.dropout(_box_features, p=0.5)
@@ -354,6 +354,15 @@ class PUAOICRROIHeads(ROIHeads):
             _box_weight = (_box_weight - _box_weight_min) / (_box_weight_max - _box_weight_min)
             if self.pua_weight_reverse:
                 _box_weight = 1 - _box_weight   # 两级反转
+
+        if _cal_uc_mode == 'wsddn_softmax':
+            _box_features = self.box_head(_box_features)
+            _pred_scores, _ = self.box_predictor(_box_features)
+            _box_var = torch.var(_pred_scores, dim=1)
+            _box_var = torch.clamp(_box_var, min=1e-6)
+            _box_weight = torch.log(_box_var)
+            _box_weight_min, _box_weight_max = torch.min(_box_weight), torch.max(_box_weight)
+            _box_weight = (_box_weight - _box_weight_min) / (_box_weight_max - _box_weight_min)
 
         if _cal_uc_mode == 'oicr_infer':
             _gt_classes = torch.unique(self.gt_classes_img_int[0])
@@ -409,7 +418,7 @@ class PUAOICRROIHeads(ROIHeads):
         torch.cuda.empty_cache()
 
         # pua
-        if self.training and self.iter >= self.pua_start_iter:
+        if self.training and self.iter >= self.pua_start_iter or True:
             if self.iter == self.pua_start_iter:
                 print('---------')
             _box_features = box_features.clone().detach()
